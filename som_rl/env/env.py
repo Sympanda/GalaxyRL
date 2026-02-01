@@ -15,15 +15,21 @@ from gymnasium import spaces
 ActionMode = Literal[
     "teleport_node",     # action = node_idx
     "teleport_xy",       # action = (x, y)  -> node_idx
-    "factor_xy",         # action = (x_action, y_action) -> node_idx (200+200)
+    "factor_xy",         # action = (x_action, y_action) -> node_idx
     "cursor_move",       # action = move (up/down/left/right) + optional act
     "cursor_move_act",   # action = move or "act" (apply to current cursor)
-    "cursor_local_k",    # action = local index within KxK patch around cursor (apply there)
+    "cursor_local_k",    # action = local index within ps x ps patch around cursor (apply there)
 ]
 
 ObsMode = Literal[
     "global_bins",       # (H,W) current bins (int)
-    "local_patch",       # patch of bin-map + umatrix (+ optional extra channels later)
+    "local_patch",       # patch of bin-map + umatrix (+ optional extra channels)
+]
+
+CooldownPolicy = Literal[
+    "none",          # ignore cooldown; still track channels if enabled
+    "no_act",        # if target node on cooldown, do not act this step (reward=0)
+    "invalid",       # if target node on cooldown, treat as invalid action (penalty)
 ]
 
 
@@ -37,8 +43,8 @@ class SOMEnvConfig:
 
     # cursor-based modes
     start_xy: Optional[Tuple[int, int]] = None
-    patch_size: int = 9               # for local observations / local actions; must be odd
-    allow_act_every_step: bool = True # if True: every step can trigger backend; else only on explicit ACT action
+    patch_size: int = 9
+    allow_act_every_step: bool = True
 
     # episode control
     max_steps: int = 2000
@@ -46,17 +52,27 @@ class SOMEnvConfig:
     patience: int = 200
 
     # reward shaping
-    reward_type: Literal["delta", "raw"] = "delta"  # delta trace recommended
-    clip_reward: Optional[float] = None             # e.g. 1.0 to clip
-    no_op_penalty: float = 0.0                      # penalty if backend chooses same bin
-    invalid_action_penalty: float = -1.0            # e.g. out-of-range x/y if torus=False, invalid local etc.
+    reward_type: Literal["delta", "raw"] = "delta"
+    clip_reward: Optional[float] = None
+    no_op_penalty: float = 0.0
+    invalid_action_penalty: float = -1.0
 
     # observation toggles
     include_umatrix: bool = True
 
+    # extra observation channels (all derived; no leakage)
+    include_visit_count: bool = True          # how many times node has been acted on
+    include_cooldown: bool = True             # remaining cooldown (steps)
+    include_steps_since_act: bool = True      # steps since last act on node (capped)
+
+    # cooldown dynamics
+    cooldown_steps: int = 0                   # 0 disables cooldown (still can track)
+    cooldown_policy: CooldownPolicy = "no_act"
+    steps_since_cap: int = 10_000             # cap for steps_since_act channel
+
 
 # ---------------------------
-# Helpers (torus wrapping + patch extraction)
+# Helpers
 # ---------------------------
 
 def _wrap(v: int, m: int) -> int:
@@ -66,12 +82,11 @@ def _clip(v: int, lo: int, hi: int) -> int:
     return int(np.clip(v, lo, hi))
 
 def _extract_patch_torus(A: np.ndarray, x: int, y: int, ps: int) -> np.ndarray:
-    # A is (H,W)
     H, W = A.shape
     r = ps // 2
-    xs = (np.arange(x - r, x + r + 1) % W).astype(int)  # x is column
-    ys = (np.arange(y - r, y + r + 1) % H).astype(int)  # y is row
-    return A[np.ix_(ys, xs)]  # (ps, ps)
+    xs = (np.arange(x - r, x + r + 1) % W).astype(int)
+    ys = (np.arange(y - r, y + r + 1) % H).astype(int)
+    return A[np.ix_(ys, xs)]
 
 def _extract_patch_clipped(A: np.ndarray, x: int, y: int, ps: int) -> np.ndarray:
     H, W = A.shape
@@ -89,100 +104,92 @@ class SOMBinningEnv(gym.Env):
     """
     Gymnasium env wrapping SOMControl backend.
 
-    Design goal:
-      - Action selects *where* to act (node/cursor/local cell/etc).
-      - Backend greedily picks best bin for that node (TreeCorr-consistent).
-      - Reward returned as delta trace (recommended) or raw trace.
-
-    This env is intentionally flexible via action_mode; choose one at init.
+    Requires som_control expose:
+      - H, W, N
+      - current_bins: (N,) int in [0..10]
+      - xy_to_index(x,y)->node
+      - step_node(node_idx)-> dict:
+            { node, old_bin, chosen_bin, delta_reward, reward, is_noop }
+      - optional: umatrix (H,W) float32
     """
 
     metadata = {"render_modes": []}
 
     def __init__(self, som_control, cfg: SOMEnvConfig):
-        """
-        som_control must expose:
-          - H, W, N
-          - current_bins: (N,) int
-          - index_to_xy(node)->(x,y) and xy_to_index(x,y)->node
-          - step_node(node_idx)-> dict with keys: delta_reward, reward, chosen_bin, old_bin, node
-          - optional: umatrix (H,W) float32
-        """
         super().__init__()
         self.som = som_control
         self.cfg = cfg
 
         self.H, self.W = cfg.grid_shape
-        assert (self.H, self.W) == (200, 200), "You said 200x200; keep this locked unless you change config."
+        if (self.H, self.W) != (200, 200):
+            raise ValueError("This project locks 200x200 unless you change everything coherently.")
+        self.N = self.H * self.W
 
         if cfg.patch_size % 2 == 0:
             raise ValueError("patch_size must be odd")
         self.ps = cfg.patch_size
         self.r = self.ps // 2
 
+        # per-node bookkeeping (derived only)
+        self.visit_count = np.zeros(self.N, dtype=np.int32)
+        self.cooldown = np.zeros(self.N, dtype=np.int32)
+        self.steps_since_act = np.full(self.N, cfg.steps_since_cap, dtype=np.int32)
+
         self._step = 0
         self._no_improve_streak = 0
-        self._last_reward = None
 
-        # cursor state (used by cursor_* modes)
         self.cursor_x = 0
         self.cursor_y = 0
 
-        # ---------------- action space ----------------
         self.action_space = self._build_action_space(cfg.action_mode)
-
-        # ---------------- observation space ----------------
         self.observation_space = self._build_observation_space(cfg.obs_mode)
 
     # ---------- spaces ----------
     def _build_action_space(self, mode: ActionMode) -> spaces.Space:
         if mode == "teleport_node":
-            return spaces.Discrete(self.H * self.W)
-
-        if mode == "teleport_xy":
-            # (x,y) in [0..199]
+            return spaces.Discrete(self.N)
+        if mode in ("teleport_xy", "factor_xy"):
             return spaces.MultiDiscrete([self.W, self.H])
-
-        if mode == "factor_xy":
-            # same as teleport_xy, but intended conceptual factorization
-            return spaces.MultiDiscrete([self.W, self.H])
-
         if mode == "cursor_move":
-            # movement only (up/down/left/right)
             return spaces.Discrete(4)
-
         if mode == "cursor_move_act":
-            # 0..3 move, 4 act
             return spaces.Discrete(5)
-
         if mode == "cursor_local_k":
-            # select one cell in local patch around cursor (ps*ps choices)
             return spaces.Discrete(self.ps * self.ps)
-
         raise ValueError(f"Unknown action_mode: {mode}")
 
     def _build_observation_space(self, mode: ObsMode) -> spaces.Space:
-        # We keep obs compact and stable across modes.
-        # Use Dict with:
-        #   - "bins": (ps,ps) int32 for local_patch, or (H,W) for global_bins
-        #   - "umatrix": (ps,ps) float32 optional
-        #   - "cursor": (2,) int32 for cursor-based modes (always included; cheap)
+        # Always Dict. We add optional extra channels as separate entries to keep it explicit.
+        obs: Dict[str, spaces.Space] = {
+            "cursor": spaces.Box(low=0, high=max(self.H, self.W), shape=(2,), dtype=np.int32),
+        }
+
         if mode == "global_bins":
-            obs = {
-                "bins": spaces.Box(low=0, high=10, shape=(self.H, self.W), dtype=np.int32),
-                "cursor": spaces.Box(low=0, high=max(self.H, self.W), shape=(2,), dtype=np.int32),
-            }
+            obs["bins"] = spaces.Box(low=0, high=10, shape=(self.H, self.W), dtype=np.int32)
             if self.cfg.include_umatrix and getattr(self.som, "umatrix", None) is not None:
                 obs["umatrix"] = spaces.Box(low=-np.inf, high=np.inf, shape=(self.H, self.W), dtype=np.float32)
+
+            if self.cfg.include_visit_count:
+                obs["visit_count"] = spaces.Box(low=0, high=np.iinfo(np.int32).max, shape=(self.H, self.W), dtype=np.int32)
+            if self.cfg.include_cooldown:
+                obs["cooldown"] = spaces.Box(low=0, high=max(0, int(self.cfg.cooldown_steps)), shape=(self.H, self.W), dtype=np.int32)
+            if self.cfg.include_steps_since_act:
+                obs["steps_since_act"] = spaces.Box(low=0, high=int(self.cfg.steps_since_cap), shape=(self.H, self.W), dtype=np.int32)
+
             return spaces.Dict(obs)
 
         if mode == "local_patch":
-            obs = {
-                "bins": spaces.Box(low=0, high=10, shape=(self.ps, self.ps), dtype=np.int32),
-                "cursor": spaces.Box(low=0, high=max(self.H, self.W), shape=(2,), dtype=np.int32),
-            }
+            obs["bins"] = spaces.Box(low=0, high=10, shape=(self.ps, self.ps), dtype=np.int32)
             if self.cfg.include_umatrix and getattr(self.som, "umatrix", None) is not None:
                 obs["umatrix"] = spaces.Box(low=-np.inf, high=np.inf, shape=(self.ps, self.ps), dtype=np.float32)
+
+            if self.cfg.include_visit_count:
+                obs["visit_count"] = spaces.Box(low=0, high=np.iinfo(np.int32).max, shape=(self.ps, self.ps), dtype=np.int32)
+            if self.cfg.include_cooldown:
+                obs["cooldown"] = spaces.Box(low=0, high=max(0, int(self.cfg.cooldown_steps)), shape=(self.ps, self.ps), dtype=np.int32)
+            if self.cfg.include_steps_since_act:
+                obs["steps_since_act"] = spaces.Box(low=0, high=int(self.cfg.steps_since_cap), shape=(self.ps, self.ps), dtype=np.int32)
+
             return spaces.Dict(obs)
 
         raise ValueError(f"Unknown obs_mode: {mode}")
@@ -192,13 +199,17 @@ class SOMBinningEnv(gym.Env):
         super().reset(seed=seed)
         self._step = 0
         self._no_improve_streak = 0
-        self._last_reward = None
 
-        # Reset backend bins
+        # backend
         if hasattr(self.som, "reset_to_initial"):
             self.som.reset_to_initial()
 
-        # Cursor init
+        # bookkeeping
+        self.visit_count.fill(0)
+        self.cooldown.fill(0)
+        self.steps_since_act.fill(int(self.cfg.steps_since_cap))
+
+        # cursor init
         if self.cfg.start_xy is None:
             rng = np.random.default_rng(seed)
             self.cursor_x = int(rng.integers(0, self.W))
@@ -217,54 +228,57 @@ class SOMBinningEnv(gym.Env):
         return obs, info
 
     def _bins_grid(self) -> np.ndarray:
-        # current_bins is (N,) with node idx mapping to (x,y) via row-major in SOMControl
-        bins = self.som.current_bins.reshape(self.H, self.W)  # assumes same mapping as SOMControl (y*W+x)
-        return bins
+        return self.som.current_bins.reshape(self.H, self.W)
+
+    def _grid_from_flat(self, A_flat: np.ndarray) -> np.ndarray:
+        return np.asarray(A_flat).reshape(self.H, self.W)
+
+    def _extract(self, A2d: np.ndarray) -> np.ndarray:
+        if self.cfg.obs_mode == "global_bins":
+            return A2d
+        if self.cfg.torus:
+            return _extract_patch_torus(A2d, self.cursor_x, self.cursor_y, self.ps)
+        return _extract_patch_clipped(A2d, self.cursor_x, self.cursor_y, self.ps)
 
     def _obs(self) -> Dict[str, Any]:
-        bins_grid = self._bins_grid()
-
-        if self.cfg.obs_mode == "global_bins":
-            out = {
-                "bins": bins_grid.astype(np.int32, copy=False),
-                "cursor": np.array([self.cursor_x, self.cursor_y], dtype=np.int32),
-            }
-            if "umatrix" in self.observation_space.spaces and getattr(self.som, "umatrix", None) is not None:
-                out["umatrix"] = np.asarray(self.som.umatrix, dtype=np.float32)
-            return out
-
-        # local patch
-        if self.cfg.torus:
-            bins_patch = _extract_patch_torus(bins_grid, self.cursor_x, self.cursor_y, self.ps)
-            umat = getattr(self.som, "umatrix", None)
-            umat_patch = _extract_patch_torus(umat, self.cursor_x, self.cursor_y, self.ps) if umat is not None else None
-        else:
-            bins_patch = _extract_patch_clipped(bins_grid, self.cursor_x, self.cursor_y, self.ps)
-            umat = getattr(self.som, "umatrix", None)
-            umat_patch = _extract_patch_clipped(umat, self.cursor_x, self.cursor_y, self.ps) if umat is not None else None
-
-        out = {
-            "bins": bins_patch.astype(np.int32, copy=False),
+        out: Dict[str, Any] = {
             "cursor": np.array([self.cursor_x, self.cursor_y], dtype=np.int32),
         }
-        if "umatrix" in self.observation_space.spaces and umat_patch is not None:
-            out["umatrix"] = umat_patch.astype(np.float32, copy=False)
+
+        bins_grid = self._bins_grid()
+        out["bins"] = self._extract(bins_grid).astype(np.int32, copy=False)
+
+        if "umatrix" in self.observation_space.spaces and getattr(self.som, "umatrix", None) is not None:
+            out["umatrix"] = self._extract(np.asarray(self.som.umatrix, dtype=np.float32)).astype(np.float32, copy=False)
+
+        if "visit_count" in self.observation_space.spaces:
+            out["visit_count"] = self._extract(self._grid_from_flat(self.visit_count)).astype(np.int32, copy=False)
+
+        if "cooldown" in self.observation_space.spaces:
+            out["cooldown"] = self._extract(self._grid_from_flat(self.cooldown)).astype(np.int32, copy=False)
+
+        if "steps_since_act" in self.observation_space.spaces:
+            out["steps_since_act"] = self._extract(self._grid_from_flat(self.steps_since_act)).astype(np.int32, copy=False)
+
         return out
 
     # ---------- step ----------
     def step(self, action):
         self._step += 1
 
-        acted = False
+        # global decay / increment trackers (O(N), but N=40k so fine)
+        if self.cfg.cooldown_steps > 0 and np.any(self.cooldown):
+            self.cooldown = np.maximum(self.cooldown - 1, 0)
+        self.steps_since_act = np.minimum(self.steps_since_act + 1, int(self.cfg.steps_since_cap))
+
         info: Dict[str, Any] = {"step": self._step}
         reward = 0.0
-
+        acted = False
         node_idx: Optional[int] = None
 
         try:
             node_idx, acted = self._resolve_action_to_node(action)
         except Exception as e:
-            # Invalid action -> penalize; no backend step.
             obs = self._obs()
             reward = float(self.cfg.invalid_action_penalty)
             terminated = False
@@ -272,39 +286,54 @@ class SOMBinningEnv(gym.Env):
             info.update({"error": str(e), "acted": False})
             return obs, reward, terminated, truncated, info
 
-        # Apply backend move if this step is an "act"
+        # cooldown gating
+        if acted and node_idx is not None and self.cfg.cooldown_policy != "none":
+            if self.cooldown[int(node_idx)] > 0:
+                if self.cfg.cooldown_policy == "no_act":
+                    acted = False
+                    info["cooldown_blocked"] = True
+                elif self.cfg.cooldown_policy == "invalid":
+                    obs = self._obs()
+                    reward = float(self.cfg.invalid_action_penalty)
+                    terminated = False
+                    truncated = self._step >= self.cfg.max_steps
+                    info.update({"cooldown_blocked": True, "acted": False})
+                    return obs, reward, terminated, truncated, info
+
         if acted and node_idx is not None:
-            out = self.som.step_node(node_idx)
+            out = self.som.step_node(int(node_idx))  # must include is_noop
             raw_delta = float(out["delta_reward"])
             raw_reward = float(out["reward"])
-            chosen_bin = int(out["chosen_bin"])
-            old_bin = int(out["old_bin"])
+            is_noop = bool(out.get("is_noop", False))
 
-            if self.cfg.reward_type == "delta":
-                reward = raw_delta
-            else:
-                reward = raw_reward
-
-            if chosen_bin == old_bin and self.cfg.no_op_penalty != 0.0:
+            # reward signal
+            reward = raw_delta if self.cfg.reward_type == "delta" else raw_reward
+            if is_noop and self.cfg.no_op_penalty != 0.0:
                 reward += float(self.cfg.no_op_penalty)
 
+            # update bookkeeping for the acted node
+            n = int(node_idx)
+            self.visit_count[n] += 1
+            self.steps_since_act[n] = 0
+            if self.cfg.cooldown_steps > 0:
+                self.cooldown[n] = int(self.cfg.cooldown_steps)
+
             info.update(out)
+            info["acted"] = True
         else:
-            # movement-only steps
             reward = 0.0
-            info.update({"acted": False})
+            info["acted"] = False
 
         if self.cfg.clip_reward is not None:
             c = float(self.cfg.clip_reward)
             reward = float(np.clip(reward, -c, c))
 
-        # termination / truncation
         truncated = self._step >= self.cfg.max_steps
         terminated = False
 
         if self.cfg.terminate_on_no_improve:
-            # define "improve" as positive delta when acting
-            if acted and reward > 0:
+            improved = bool(info.get("acted", False) and reward > 0.0)
+            if improved:
                 self._no_improve_streak = 0
             else:
                 self._no_improve_streak += 1
@@ -317,17 +346,11 @@ class SOMBinningEnv(gym.Env):
 
     # ---------- action resolution ----------
     def _resolve_action_to_node(self, action) -> Tuple[Optional[int], bool]:
-        """
-        Returns:
-          (node_idx, acted)
-
-        acted=False means "just moved cursor" or "no-op step".
-        """
         mode = self.cfg.action_mode
 
         if mode == "teleport_node":
             node = int(action)
-            if not (0 <= node < self.H * self.W):
+            if not (0 <= node < self.N):
                 raise ValueError("node_idx out of range")
             return node, True
 
@@ -339,15 +362,12 @@ class SOMBinningEnv(gym.Env):
                 if not (0 <= x < self.W and 0 <= y < self.H):
                     raise ValueError("x,y out of range (torus=False)")
             self.cursor_x, self.cursor_y = x, y
-            node = self.som.xy_to_index(x, y)
-            return node, True
+            return int(self.som.xy_to_index(x, y)), True
 
         if mode == "cursor_move":
-            # move only; acting happens every step only if allow_act_every_step
             self._cursor_move(int(action))
             if self.cfg.allow_act_every_step:
-                node = self.som.xy_to_index(self.cursor_x, self.cursor_y)
-                return node, True
+                return int(self.som.xy_to_index(self.cursor_x, self.cursor_y)), True
             return None, False
 
         if mode == "cursor_move_act":
@@ -355,16 +375,13 @@ class SOMBinningEnv(gym.Env):
             if a in (0, 1, 2, 3):
                 self._cursor_move(a)
                 if self.cfg.allow_act_every_step:
-                    node = self.som.xy_to_index(self.cursor_x, self.cursor_y)
-                    return node, True
+                    return int(self.som.xy_to_index(self.cursor_x, self.cursor_y)), True
                 return None, False
             if a == 4:
-                node = self.som.xy_to_index(self.cursor_x, self.cursor_y)
-                return node, True
+                return int(self.som.xy_to_index(self.cursor_x, self.cursor_y)), True
             raise ValueError("invalid cursor_move_act action")
 
         if mode == "cursor_local_k":
-            # action selects a local cell in patch around cursor; always acts
             a = int(action)
             if not (0 <= a < self.ps * self.ps):
                 raise ValueError("local_k action out of range")
@@ -377,13 +394,11 @@ class SOMBinningEnv(gym.Env):
             else:
                 if not (0 <= x < self.W and 0 <= y < self.H):
                     raise ValueError("selected local cell out of bounds (torus=False)")
-            node = self.som.xy_to_index(x, y)
-            return node, True
+            return int(self.som.xy_to_index(x, y)), True
 
         raise ValueError(f"Unknown action_mode: {mode}")
 
     def _cursor_move(self, move: int) -> None:
-        # 0 up, 1 down, 2 left, 3 right
         x, y = self.cursor_x, self.cursor_y
         if move == 0:
             y -= 1

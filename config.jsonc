@@ -1,0 +1,106 @@
+{
+  // -------------------------
+  // SOM backend (physics)
+  // -------------------------
+  "backend": {
+    "grid_shape": [200, 200],
+    "num_bins": 11,
+
+    // Numerical stability
+    "eps": 1e-12,
+
+    // Match your notebook normalization constants
+    "dr_scale": 10.0,
+    "rd_scale": 10.0,
+    "rr_scale": 100.0,
+
+    // No-op detection (is_noop = best_delta <= noop_eps)
+    "noop_eps": 0.0
+  },
+
+  // -------------------------
+  // Environment (RL wrapper)
+  // -------------------------
+  "env": {
+    "grid_shape": [200, 200],
+    "torus": true,
+
+    // Action interface
+    "action_mode": "teleport_node",
+
+    // Observation interface
+    "obs_mode": "local_patch",
+    "patch_size": 9,
+
+    // Whether an action implies "act" each step in cursor modes
+    "allow_act_every_step": true,
+
+    // Reward emitted by env
+    "reward_type": "delta",
+    "clip_reward": null,
+    "no_op_penalty": 0.0,
+    "invalid_action_penalty": -1.0,
+
+    // Episode control
+    "max_steps": 2000,
+    "terminate_on_no_improve": false,
+    "patience": 200,
+
+    // Observation toggles
+    "include_umatrix": true,
+
+    // Bin encoding in observation
+    // - "int" gives (ps,ps) ints in [0..10]
+    // - "onehot" gives (11,ps,ps) float32 0/1 (only allowed for local_patch)
+    "bins_encoding": "int",
+
+    // -------------------------
+    // Bonus channels & masking
+    // -------------------------
+
+    // Adds per-node visit counts (or a patch of them) to observation
+    "visit_counts": {
+      "enabled": true,
+
+      // What value to store:
+      // - "ever": cumulative count over episode
+      // - "recent": exponentially decayed count (EMA) so old visits fade
+      "mode": "ever",
+
+      // Only used if mode="recent"
+      "ema_alpha": 0.05,
+
+      // How to expose counts in obs:
+      // - "local_patch": add (ps,ps) float32 channel
+      // - "global": add (H,W) float32 channel (not recommended)
+      "obs_inclusion": "local_patch",
+
+      // Scaling applied before putting into obs
+      // - "none": raw counts
+      // - "log1p": log(1+count) (recommended)
+      // - "sqrt": sqrt(count)
+      "scale": "log1p"
+    },
+
+    // Cooldown masking: temporarily discourage or disallow selecting nodes
+    "cooldown": {
+      "enabled": true,
+
+      // Length in env steps that a node stays "cooling down" after an ACT
+      "steps": 25,
+
+      // If true: selecting a cooling node is invalid (penalize and no act)
+      // If false: selecting is allowed but env may add a penalty
+      "hard_mask": false,
+
+      // Only used if hard_mask=false:
+      // penalty added when you ACT on a node that is cooling
+      "penalty": -0.05,
+
+      // Apply cooldown when:
+      // - "act": only when backend step_node is called
+      // - "any_select": whenever the node is selected (including moves)
+      "apply_on": "act"
+    }
+  }
+}
