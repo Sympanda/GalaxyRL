@@ -1,7 +1,7 @@
 import numpy as np
 
 from som_rl.datastore.correlation_store import CorrelationStore, CorrelationPaths
-from som_rl.som.som_state import SOMState
+from som_rl.old.som_state import SOMState
 
 
 def main():

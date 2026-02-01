@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 from gymnasium import Env, spaces
 
-from som_rl.som.som_state import SOMState
+from som_rl.old.som_state import SOMState
 
 
 class GlobalPointerTwoStageEnv(Env):
