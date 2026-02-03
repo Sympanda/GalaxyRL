@@ -7,14 +7,14 @@ import numpy as np
 
 @dataclass(frozen=True)
 class SOMBackendConfig:
-    grid_shape: Tuple[int, int]  # (H, W)
+    grid_shape: Tuple[int, int]
     num_bins: int = 11
-
     eps: float = 1e-12
     dr_scale: float = 10.0
     rd_scale: float = 10.0
-    rr_scale: float = 100.0  # dr_scale * rd_scale
-    noop_eps: float = 0.0    # treat best_delta <= noop_eps as noop
+    rr_scale: float = 100.0
+    min_delta: float = 1e-8   # NEW: minimum accepted trace gain
+    tol: float = 1e-12        # NEW: numerical tolerance for safety
 
 
 class SOMControl:
@@ -206,23 +206,47 @@ class SOMControl:
         r0 = self.reward_trace()
 
         bestb, bestd = self.best_bin_for_node(node)
-        if bestb != oldb:
-            self._rank1_move(node, oldb, bestb)
+        # Reject tiny gains (noise / churn)
+        if bestd < self.cfg.min_delta:
+            return {
+                "node": node,
+                "old_bin": oldb,
+                "chosen_bin": oldb,
+                "delta_reward": 0.0,
+                "reward": float(r0),
+                "is_noop": True,
+                "best_delta": float(bestd),
+            }
 
+        # Apply
+        self._rank1_move(node, oldb, bestb)
         r1 = self.reward_trace()
-        bestd = float(r1 - r0)  # recompute to be consistent with applied state
+        d = r1 - r0
 
-        is_noop = bool(bestd <= float(self.cfg.noop_eps))
+        # Hard safety: never allow negative due to bugs/numerics
+        if d < -self.cfg.tol:
+            self._rank1_move(node, bestb, oldb)
+            return {
+                "node": node,
+                "old_bin": oldb,
+                "chosen_bin": oldb,
+                "delta_reward": 0.0,
+                "reward": float(r0),
+                "is_noop": True,
+                "best_delta": float(bestd),
+                "warning": f"negative delta after apply: {d}",
+            }
 
         return {
             "node": node,
             "old_bin": oldb,
             "chosen_bin": int(bestb),
-            "best_delta": float(bestd),
-            "is_noop": is_noop,
-            "delta_reward": float(bestd),
+            "delta_reward": float(d),
             "reward": float(r1),
+            "is_noop": False,
+            "best_delta": float(bestd),
         }
+
 
     def reset_to_initial(self) -> None:
         self.current_bins[:] = self.initial_bins

@@ -301,10 +301,11 @@ class SOMBinningEnv(gym.Env):
                     return obs, reward, terminated, truncated, info
 
         if acted and node_idx is not None:
-            out = self.som.step_node(int(node_idx))  # must include is_noop
+            out = self.som.step_node(node_idx)
             raw_delta = float(out["delta_reward"])
             raw_reward = float(out["reward"])
             is_noop = bool(out.get("is_noop", False))
+
 
             # reward signal
             reward = raw_delta if self.cfg.reward_type == "delta" else raw_reward
