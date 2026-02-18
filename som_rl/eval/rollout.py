@@ -108,6 +108,9 @@ def run_episode(
 
         rows.append({
             "t": t,
+            "level": info.get("level", None),
+            "T": info.get("T", None),
+            "floor": info.get("min_delta_E", None),
             "action": action,
             "reward_env": float(reward_env),
             "reward_trace": float(trace),
@@ -117,6 +120,7 @@ def run_episode(
             "y": y,
             "old_bin": info.get("old_bin", None),
             "chosen_bin": info.get("chosen_bin", None),
+            "accepted": bool(info.get("accepted", False)),
             "is_noop": bool(info.get("is_noop", False)),
             "acted": bool(info.get("acted", True)),
             "terminated": bool(terminated),

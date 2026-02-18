@@ -118,6 +118,7 @@ def plot_bin_snapshots(
     return axarr
 
 
+
 def save_all_plots(outdir: str, env, art: RunArtifacts) -> None:
     os.makedirs(outdir, exist_ok=True)
 
